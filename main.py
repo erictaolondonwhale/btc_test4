@@ -100,25 +100,48 @@ def scrape_and_save():
                 data.append([rank, address, balance])
 
     if data:
-        # Save to CSV
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"bitcoin_rich_list_{timestamp}.csv"
+        timestamp = datetime.now().isoformat()
+        
+        # Connect to the SQLite database
+        conn = sqlite3.connect('bitcoin_rich_list.db')
+        cursor = conn.cursor()
 
-        with open(filename, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Rank", "Address", "Balance"])
-            writer.writerows(data)
+        # Create table if it doesn't exist
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS bitcoin_rich_list (
+            timestamp TEXT,
+            rank INTEGER,
+            address TEXT,
+            balance TEXT,
+            ins TEXT,
+            outs TEXT,
+            wallet_name TEXT
+        )
+        ''')
 
-        print(f"Data saved to {filename}")
+        # Insert data into the database
+        for row in data:
+            cursor.execute('''
+            INSERT INTO bitcoin_rich_list (timestamp, rank, address, balance, ins, outs, wallet_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (timestamp, int(row[0]), row[1], row[2], '', '', ''))
+
+        conn.commit()
+        conn.close()
+
+        print(f"Data saved to database at {timestamp}")
     else:
         print("No data found on the page")
 
 
 # Schedule the scraping task
 scheduler = BackgroundScheduler()
-scheduler.add_job(scrape_and_save, "interval", minutes=1)
+scheduler.add_job(scrape_and_save, "interval", hours=1)
 scheduler.start()
 
+@app.on_event("startup")
+async def startup_event():
+    scrape_and_save()  # Run once at startup
 
 @app.get("/")
 async def root():
@@ -145,6 +168,5 @@ async def report():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
+    uvicorn.run(app, host="0.0.0.0", port=8001)  # Changed port to 8001
 
