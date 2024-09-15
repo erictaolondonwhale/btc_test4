@@ -134,9 +134,9 @@ def scrape_and_save():
         print("No data found on the page")
 
 
-# Schedule the scraping task
+# Módosítás az ütemezőben
 scheduler = BackgroundScheduler()
-scheduler.add_job(scrape_and_save, "interval", hours=1)
+scheduler.add_job(scrape_and_save, "interval", hours=3)
 scheduler.start()
 
 @app.on_event("startup")
