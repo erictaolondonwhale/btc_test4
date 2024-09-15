@@ -1,90 +1,150 @@
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from bs4 import BeautifulSoup
+import requests
 import csv
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
 import sqlite3
-import re
-from datetime import datetime
-import os
+import io
 
-# Kapcsolódás az adatbázishoz (létrehozza, ha nem létezik)
-conn = sqlite3.connect('bitcoin_rich_list.db')
-cursor = conn.cursor()
+app = FastAPI()
 
-# Tábla létrehozása
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS bitcoin_rich_list (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT,
-    rank INTEGER,
-    address TEXT,
-    balance TEXT,
-    btc_amount REAL,
-    usd_amount REAL,
-    ins INTEGER,
-    outs INTEGER,
-    wallet_name TEXT
-)
-''')
+def get_data_for_timestamp(cursor, timestamp):
+    cursor.execute('''
+    SELECT rank, address, ins, outs, wallet_name
+    FROM bitcoin_rich_list
+    WHERE timestamp = ?
+    ORDER BY rank
+    ''', (timestamp,))
+    return cursor.fetchall()
 
-# Változtatások mentése és kapcsolat bezárása
-conn.commit()
-conn.close()
+def compare_data(prev_data, curr_data):
+    changes = []
+    for prev, curr in zip(prev_data, curr_data):
+        if prev[2] != curr[2] or prev[3] != curr[3]:  # Only check INS and OUTS
+            changes.append({
+                'rank': curr[0],
+                'address': curr[1],
+                'prev_ins': prev[2],
+                'curr_ins': curr[2],
+                'prev_outs': prev[3],
+                'curr_outs': curr[3],
+                'wallet_name': curr[4]
+            })
+    return changes
 
-print("A bitcoin_rich_list tábla sikeresen létrehozva.")
+def generate_report():
+    conn = sqlite3.connect('bitcoin_rich_list.db')
+    cursor = conn.cursor()
 
+    cursor.execute('SELECT MIN(timestamp), MAX(timestamp) FROM bitcoin_rich_list')
+    min_timestamp, max_timestamp = cursor.fetchone()
 
+    current_time = datetime.fromisoformat(min_timestamp)
+    end_time = datetime.fromisoformat(max_timestamp)
 
-def extract_wallet_name(address):
-    match = re.search(r'wallet:\s*([^B]+)', address)
-    return match.group(1).strip() if match else None
+    output = io.StringIO()
 
-def extract_btc_amount(balance):
-    match = re.search(r'([\d,]+)\s*BTC', balance)
-    return float(match.group(1).replace(',', '')) if match else None
-
-def extract_usd_amount(balance):
-    match = re.search(r'\$\s*([\d,]+)', balance)
-    return float(match.group(1).replace(',', '')) if match else None
-
-def extract_ins_outs(address):
-    ins_match = re.search(r'Ins:(\d+)', address)
-    outs_match = re.search(r'Outs:(\d+)', address)
-    ins = int(ins_match.group(1)) if ins_match else None
-    outs = int(outs_match.group(1)) if outs_match else None
-    return ins, outs
-
-def extract_timestamp_from_filename(filename):
-    match = re.search(r'(\d{8}_\d{6})', filename)
-    if match:
-        return datetime.strptime(match.group(1), '%Y%m%d_%H%M%S').isoformat()
-    return None
-
-conn = sqlite3.connect('bitcoin_rich_list.db')
-cursor = conn.cursor()
-
-for filename in os.listdir('.'):
-    if filename.endswith('.csv') and filename.startswith('bitcoin_rich_list_'):
-        timestamp = extract_timestamp_from_filename(filename)
+    while current_time <= end_time:
+        next_time = current_time + timedelta(hours=3)
         
-        with open(filename, 'r') as csvfile:
-            csvreader = csv.reader(csvfile)
-            next(csvreader)  # Skip header row
-            for row in csvreader:
-                rank = int(row[0])
-                address = row[1]
-                balance = row[2]
-                
-                wallet_name = extract_wallet_name(address)
-                btc_amount = extract_btc_amount(balance)
-                usd_amount = extract_usd_amount(balance)
-                ins, outs = extract_ins_outs(address)
-                
-                cursor.execute('''
-                    INSERT INTO bitcoin_rich_list (timestamp, rank, address, balance, btc_amount, usd_amount, ins, outs, wallet_name)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (timestamp, rank, address, balance, btc_amount, usd_amount, ins, outs, wallet_name))
-        
-        print(f"Feldolgozva: {filename}")
+        current_data = get_data_for_timestamp(cursor, current_time.isoformat())
+        next_data = get_data_for_timestamp(cursor, next_time.isoformat())
 
-conn.commit()
-conn.close()
+        if current_data and next_data:
+            changes = compare_data(current_data, next_data)
+            
+            if changes:
+                output.write(f"<h2>Változások {current_time.isoformat()} és {next_time.isoformat()} között:</h2>")
+                for change in changes:
+                    output.write(f"<p>Rank: {change['rank']}, Address: {change['address']}<br>")
+                    if change['prev_ins'] != change['curr_ins']:
+                        output.write(f"INS változás: {change['prev_ins']} -> {change['curr_ins']}<br>")
+                    if change['prev_outs'] != change['curr_outs']:
+                        output.write(f"OUTS változás: {change['prev_outs']} -> {change['curr_outs']}<br>")
+                    output.write(f"Wallet név: {change['wallet_name']}</p>")
+                    output.write("<hr>")
 
-print("Az összes CSV fájl feldolgozása befejeződött.")
+        current_time = next_time
+
+    conn.close()
+    return output.getvalue()
+
+def scrape_and_save():
+    url = "https://bitinfocharts.com/top-100-richest-bitcoin-addresses.html"
+    response = requests.get(url)
+    soup = BeautifulSoup(response.content, "html.parser")
+
+    # Find all table IDs
+    table_ids = [table.get("id") for table in soup.find_all("table", id=True)]
+
+    # Find the tables with the rich list
+    tables = []
+    for table_id in table_ids:
+        table = soup.find("table", {"id": table_id})
+        if table:
+            tables.append(table)
+
+    data = []
+
+    for table in tables:
+        rows = table.find_all("tr")[1:]  # Skip the header row
+
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) >= 3:
+                rank = cols[0].text.strip()
+                address = cols[1].text.strip()
+                balance = cols[2].text.strip()
+                data.append([rank, address, balance])
+
+    if data:
+        # Save to CSV
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"bitcoin_rich_list_{timestamp}.csv"
+
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Rank", "Address", "Balance"])
+            writer.writerows(data)
+
+        print(f"Data saved to {filename}")
+    else:
+        print("No data found on the page")
+
+
+# Schedule the scraping task
+scheduler = BackgroundScheduler()
+scheduler.add_job(scrape_and_save, "interval", minutes=1)
+scheduler.start()
+
+
+@app.get("/")
+async def root():
+    return {"message": "Bitcoin Rich List Scraper is running"}
+
+
+@app.get("/report", response_class=HTMLResponse)
+async def report():
+    report_content = generate_report()
+    html_content = f"""
+    <html>
+        <head>
+            <title>Bitcoin Rich List Changes Report</title>
+        </head>
+        <body>
+            <h1>Bitcoin Rich List Changes Report</h1>
+            {report_content}
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
