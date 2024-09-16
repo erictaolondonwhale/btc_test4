@@ -38,25 +38,23 @@ def generate_report():
     conn = sqlite3.connect('bitcoin_rich_list.db')
     cursor = conn.cursor()
 
-    cursor.execute('SELECT MIN(timestamp), MAX(timestamp) FROM bitcoin_rich_list')
-    min_timestamp, max_timestamp = cursor.fetchone()
-
-    current_time = datetime.fromisoformat(min_timestamp)
-    end_time = datetime.fromisoformat(max_timestamp)
+    cursor.execute('SELECT DISTINCT timestamp FROM bitcoin_rich_list ORDER BY timestamp')
+    timestamps = [row[0] for row in cursor.fetchall()]
 
     output = io.StringIO()
 
-    while current_time <= end_time:
-        next_time = current_time + timedelta(hours=3)
-        
-        current_data = get_data_for_timestamp(cursor, current_time.isoformat())
-        next_data = get_data_for_timestamp(cursor, next_time.isoformat())
+    for i in range(1, len(timestamps)):
+        prev_timestamp = timestamps[i-1]
+        curr_timestamp = timestamps[i]
 
-        if current_data and next_data:
-            changes = compare_data(current_data, next_data)
+        prev_data = get_data_for_timestamp(cursor, prev_timestamp)
+        curr_data = get_data_for_timestamp(cursor, curr_timestamp)
+
+        if prev_data and curr_data:
+            changes = compare_data(prev_data, curr_data)
             
             if changes:
-                output.write(f"<h2>Változások {current_time.isoformat()} és {next_time.isoformat()} között:</h2>")
+                output.write(f"<h2>Változások {prev_timestamp} és {curr_timestamp} között:</h2>")
                 for change in changes:
                     output.write(f"<p>Rank: {change['rank']}, Address: {change['address']}<br>")
                     if change['prev_ins'] != change['curr_ins']:
@@ -65,8 +63,6 @@ def generate_report():
                         output.write(f"OUTS változás: {change['prev_outs']} -> {change['curr_outs']}<br>")
                     output.write(f"Wallet név: {change['wallet_name']}</p>")
                     output.write("<hr>")
-
-        current_time = next_time
 
     conn.close()
     return output.getvalue()
@@ -93,14 +89,17 @@ def scrape_and_save():
 
         for row in rows:
             cols = row.find_all("td")
-            if len(cols) >= 3:
+            if len(cols) >= 6:  # Feltételezve, hogy több oszlop van
                 rank = cols[0].text.strip()
                 address = cols[1].text.strip()
                 balance = cols[2].text.strip()
-                data.append([rank, address, balance])
+                ins = cols[3].text.strip()
+                outs = cols[4].text.strip()
+                wallet_name = cols[5].text.strip() if len(cols) > 5 else 'None'
+                data.append([rank, address, balance, ins, outs, wallet_name])
 
     if data:
-        timestamp = datetime.now().isoformat()
+        timestamp = datetime.now().replace(minute=0, second=0, microsecond=0).isoformat()
         
         # Connect to the SQLite database
         conn = sqlite3.connect('bitcoin_rich_list.db')
@@ -124,7 +123,7 @@ def scrape_and_save():
             cursor.execute('''
             INSERT INTO bitcoin_rich_list (timestamp, rank, address, balance, ins, outs, wallet_name)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (timestamp, int(row[0]), row[1], row[2], '', '', ''))
+            ''', (timestamp, int(row[0]), row[1], row[2], row[3], row[4], row[5]))
 
         conn.commit()
         conn.close()
@@ -134,9 +133,9 @@ def scrape_and_save():
         print("No data found on the page")
 
 
-# Módosítás az ütemezőben
+# Schedule the scraping task
 scheduler = BackgroundScheduler()
-scheduler.add_job(scrape_and_save, "interval", hours=3)
+scheduler.add_job(scrape_and_save, "interval", hours=1)
 scheduler.start()
 
 @app.on_event("startup")
@@ -146,7 +145,6 @@ async def startup_event():
 @app.get("/")
 async def root():
     return {"message": "Bitcoin Rich List Scraper is running"}
-
 
 @app.get("/report", response_class=HTMLResponse)
 async def report():
@@ -164,9 +162,7 @@ async def report():
     """
     return HTMLResponse(content=html_content)
 
-
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8001)  # Changed port to 8001
-
